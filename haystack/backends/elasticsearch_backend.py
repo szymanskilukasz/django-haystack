@@ -1,27 +1,23 @@
 from __future__ import unicode_literals
-
 import datetime
 import re
 import warnings
-
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.db.models.loading import get_model
 from django.utils import six
-
 import haystack
 from haystack.backends import BaseEngine, BaseSearchBackend, BaseSearchQuery, log_query
-from haystack.constants import DEFAULT_OPERATOR, DJANGO_CT, DJANGO_ID, ID
+from haystack.constants import ID, DJANGO_CT, DJANGO_ID, DEFAULT_OPERATOR
 from haystack.exceptions import MissingDependency, MoreLikeThisError
-from haystack.inputs import Clean, Exact, PythonData, Raw
+from haystack.inputs import PythonData, Clean, Exact, Raw
 from haystack.models import SearchResult
+from haystack.utils import get_identifier
 from haystack.utils import log as logging
-from haystack.utils import get_identifier, get_model_ct
 
 try:
     import elasticsearch
     from elasticsearch.helpers import bulk_index
-    from elasticsearch.exceptions import NotFoundError
 except ImportError:
     raise MissingDependency("The 'elasticsearch' backend requires the installation of 'elasticsearch'. Please refer to the documentation.")
 
@@ -54,13 +50,13 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
                 "analyzer": {
                     "ngram_analyzer": {
                         "type": "custom",
-                        "tokenizer": "standard",
-                        "filter": ["haystack_ngram", "lowercase"]
+                        "tokenizer": "lowercase",
+                        "filter": ["haystack_ngram"]
                     },
                     "edgengram_analyzer": {
                         "type": "custom",
-                        "tokenizer": "standard",
-                        "filter": ["haystack_edgengram", "lowercase"]
+                        "tokenizer": "lowercase",
+                        "filter": ["haystack_edgengram"]
                     }
                 },
                 "tokenizer": {
@@ -116,8 +112,6 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
         # mapping.
         try:
             self.existing_mapping = self.conn.indices.get_mapping(index=self.index_name)
-        except NotFoundError:
-            pass
         except Exception:
             if not self.silently_fail:
                 raise
@@ -137,7 +131,7 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
         if current_mapping != self.existing_mapping:
             try:
                 # Make sure the index is there first.
-                self.conn.indices.create(index=self.index_name, body=self.DEFAULT_SETTINGS, ignore=400)
+                self.conn.indices.create(self.index_name, self.DEFAULT_SETTINGS)
                 self.conn.indices.put_mapping(index=self.index_name, doc_type='modelresult', body=current_mapping)
                 self.existing_mapping = current_mapping
             except Exception:
@@ -228,11 +222,11 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
                 models_to_delete = []
 
                 for model in models:
-                    models_to_delete.append("%s:%s" % (DJANGO_CT, get_model_ct(model)))
+                    models_to_delete.append("%s:%s.%s" % (DJANGO_CT, model._meta.app_label, model._meta.module_name))
 
                 # Delete by query in Elasticsearch asssumes you're dealing with
                 # a ``query`` root object. :/
-                query = {'query': {'query_string': {'query': " OR ".join(models_to_delete)}}}
+                query = {'query_string': {'query': " OR ".join(models_to_delete)}}
                 self.conn.delete_by_query(index=self.index_name, doc_type='modelresult', body=query)
         except elasticsearch.TransportError as e:
             if not self.silently_fail:
@@ -276,10 +270,7 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
         filters = []
 
         if fields:
-            if isinstance(fields, (list, set)):
-                fields = " ".join(fields)
-
-            kwargs['fields'] = fields
+            kwargs['fields'] = list(fields)
 
         if sort_by is not None:
             order_list = []
@@ -360,7 +351,7 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
                 interval = value.get('gap_by').lower()
 
                 # Need to detect on amount (can't be applied on months or years).
-                if value.get('gap_amount', 1) != 1 and interval not in ('month', 'year'):
+                if value.get('gap_amount', 1) != 1 and not interval in ('month', 'year'):
                     # Just the first character is valid for use.
                     interval = "%s%s" % (value['gap_amount'], interval[:1])
 
@@ -395,7 +386,7 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
             limit_to_registered_models = getattr(settings, 'HAYSTACK_LIMIT_TO_REGISTERED_MODELS', True)
 
         if models and len(models):
-            model_choices = sorted(get_model_ct(model) for model in models)
+            model_choices = sorted(['%s.%s' % (model._meta.app_label, model._meta.module_name) for model in models])
         elif limit_to_registered_models:
             # Using narrow queries, limit the results to only models handled
             # with the current routers.
@@ -440,20 +431,9 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
 
         if dwithin is not None:
             lng, lat = dwithin['point'].get_coords()
-
-            # NB: the 1.0.0 release of elasticsearch introduce an
-            #     incompatible change on the distance filter formating
-            if elasticsearch.VERSION >= (1, 0, 0):
-                distance = "%(dist).6f%(unit)s" % {
-                        'dist': dwithin['distance'].km,
-                        'unit': "km"
-                    }
-            else:
-                distance = dwithin['distance'].km
-
             dwithin_filter = {
                 "geo_distance": {
-                    "distance": distance,
+                    "distance": dwithin['distance'].km,
                     dwithin['field']: {
                         "lat": lat,
                         "lon": lng
@@ -501,8 +481,7 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
         try:
             raw_results = self.conn.search(body=search_kwargs,
                                            index=self.index_name,
-                                           doc_type='modelresult',
-                                           _source=True)
+                                           doc_type='modelresult')
         except elasticsearch.TransportError as e:
             if not self.silently_fail:
                 raise
@@ -511,10 +490,9 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
             raw_results = {}
 
         return self._process_results(raw_results,
-                                     highlight=kwargs.get('highlight'),
-                                     result_class=kwargs.get('result_class', SearchResult),
-                                     distance_point=kwargs.get('distance_point'),
-                                     geo_sort=geo_sort)
+            highlight=kwargs.get('highlight'),
+            result_class=kwargs.get('result_class', SearchResult),
+            distance_point=kwargs.get('distance_point'), geo_sort=geo_sort)
 
     def more_like_this(self, model_instance, additional_query_string=None,
                        start_offset=0, end_offset=None, models=None,
@@ -590,8 +568,14 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
         content_field = unified_index.document_field
 
         for raw_result in raw_results.get('hits', {}).get('hits', []):
-            source = raw_result['_source']
-            app_label, model_name = source[DJANGO_CT].split('.')
+
+            if 'fields' in raw_result:
+                source = raw_result['fields']                
+            else:
+                source = raw_result.get('_source', {})
+
+            id = raw_result['_id']
+            app_label, model_name, idnum = id.split('.')
             additional_fields = {}
             model = get_model(app_label, model_name)
 
@@ -599,6 +583,15 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
                 for key, value in source.items():
                     index = unified_index.get_index(model)
                     string_key = str(key)
+
+                    if isinstance(value, list):
+                        if string_key in index.fields:
+                            if not index.fields[string_key].is_multivalued:
+                                source[key] = value = value[0]
+                        elif value:
+                            source[key] = value = value[0]
+                        else:
+                            source[key] = value = None
 
                     if string_key in index.fields and hasattr(index.fields[string_key], 'convert'):
                         additional_fields[string_key] = index.fields[string_key].convert(value)
@@ -722,12 +715,12 @@ class ElasticsearchSearchBackend(BaseSearchBackend):
 #            the right type of storage?
 DEFAULT_FIELD_MAPPING = {'type': 'string', 'analyzer': 'snowball'}
 FIELD_MAPPINGS = {
-    'edge_ngram': {'type': 'string', 'analyzer': 'edgengram_analyzer'},
-    'ngram':      {'type': 'string', 'analyzer': 'ngram_analyzer'},
+    'edge_ngram': {'type': 'string', 'analyzer': 'edgengram_analyzer'},        
+    'ngram':      {'type': 'string', 'analyzer': 'ngram_analyzer'},        
     'date':       {'type': 'date'},
     'datetime':   {'type': 'date'},
 
-    'location':   {'type': 'geo_point'},
+    'location':   {'type': 'geo_point'},        
     'boolean':    {'type': 'boolean'},
     'float':      {'type': 'float'},
     'long':       {'type': 'long'},
@@ -740,6 +733,25 @@ FIELD_MAPPINGS = {
 class ElasticsearchSearchQuery(BaseSearchQuery):
     def matching_all_fragment(self):
         return '*:*'
+
+    def add_spatial(self, lat, lon, sfield, distance, filter='bbox'):
+        """Adds spatial query parameters to search query"""
+        kwargs = {
+            'lat': lat,
+            'long': long,
+            'sfield': sfield,
+            'distance': distance,
+        }
+        self.spatial_query.update(kwargs)
+
+    def add_order_by_distance(self, lat, long, sfield):
+        """Orders the search result by distance from point."""
+        kwargs = {
+            'lat': lat,
+            'long': long,
+            'sfield': sfield,
+        }
+        self.order_by_distance.update(kwargs)
 
     def build_query_fragment(self, field, filter_type, value):
         from haystack import connections

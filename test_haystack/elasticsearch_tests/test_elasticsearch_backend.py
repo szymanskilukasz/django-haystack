@@ -1,25 +1,23 @@
 # -*- coding: utf-8 -*-
 import datetime
+from decimal import Decimal
 import logging as std_logging
 import operator
-from decimal import Decimal
 
 import elasticsearch
 from django.conf import settings
 from django.test import TestCase
-from django.test.utils import override_settings
 from django.utils import unittest
-from haystack import connections, indexes, reset_search_queries
+from haystack import connections, reset_search_queries
+from haystack import indexes
 from haystack.inputs import AutoQuery
 from haystack.models import SearchResult
-from haystack.query import RelatedSearchQuerySet, SearchQuerySet, SQ
+from haystack.query import SearchQuerySet, RelatedSearchQuerySet, SQ
 from haystack.utils import log as logging
 from haystack.utils.loading import UnifiedIndex
-from haystack.utils.geo import Point
-
-from ..core.models import (AFourthMockModel, AnotherMockModel, ASixthMockModel,
-                           MockModel)
-from ..mocks import MockSearchResult
+from core.models import (MockModel, AnotherMockModel,
+                         AFourthMockModel, ASixthMockModel)
+from core.tests.mocks import MockSearchResult
 
 test_pickling = True
 
@@ -34,16 +32,12 @@ except ImportError:
 
 def clear_elasticsearch_index():
     # Wipe it clean.
-    raw_es = elasticsearch.Elasticsearch(settings.HAYSTACK_CONNECTIONS['elasticsearch']['URL'])
+    raw_es = elasticsearch.Elasticsearch(settings.HAYSTACK_CONNECTIONS['default']['URL'])
     try:
-        raw_es.indices.delete(index=settings.HAYSTACK_CONNECTIONS['elasticsearch']['INDEX_NAME'])
+        raw_es.indices.delete(index=settings.HAYSTACK_CONNECTIONS['default']['INDEX_NAME'])
         raw_es.indices.refresh()
     except elasticsearch.TransportError:
         pass
-
-    # Since we've just completely deleted the index, we'll reset setup_complete so the next access will
-    # correctly define the mappings:
-    connections['elasticsearch'].get_backend().setup_complete = False
 
 
 class ElasticsearchMockSearchIndex(indexes.SearchIndex, indexes.Indexable):
@@ -203,35 +197,29 @@ class ElasticsearchSpatialSearchIndex(indexes.SearchIndex, indexes.Indexable):
     def get_model(self):
         return ASixthMockModel
 
-
 class TestSettings(TestCase):
     def test_kwargs_are_passed_on(self):
         from haystack.backends.elasticsearch_backend import ElasticsearchSearchBackend
-        backend = ElasticsearchSearchBackend('alias', **{
-            'URL': settings.HAYSTACK_CONNECTIONS['elasticsearch']['URL'],
-            'INDEX_NAME': 'testing',
-            'KWARGS': {'max_retries': 42}
-        })
+        backend = ElasticsearchSearchBackend('alias', **{'URL': {}, 'INDEX_NAME': 'testing', 'KWARGS': {'max_retries': 42}})
 
         self.assertEqual(backend.conn.transport.max_retries, 42)
-
 
 class ElasticsearchSearchBackendTestCase(TestCase):
     def setUp(self):
         super(ElasticsearchSearchBackendTestCase, self).setUp()
 
         # Wipe it clean.
-        self.raw_es = elasticsearch.Elasticsearch(settings.HAYSTACK_CONNECTIONS['elasticsearch']['URL'])
+        self.raw_es = elasticsearch.Elasticsearch(settings.HAYSTACK_CONNECTIONS['default']['URL'])
         clear_elasticsearch_index()
 
         # Stow.
-        self.old_ui = connections['elasticsearch'].get_unified_index()
+        self.old_ui = connections['default'].get_unified_index()
         self.ui = UnifiedIndex()
         self.smmi = ElasticsearchMockSearchIndex()
         self.smtmmi = ElasticsearchMaintainTypeMockSearchIndex()
         self.ui.build(indexes=[self.smmi])
-        connections['elasticsearch']._index = self.ui
-        self.sb = connections['elasticsearch'].get_backend()
+        connections['default']._index = self.ui
+        self.sb = connections['default'].get_backend()
 
         # Force the backend to rebuild the mapping each time.
         self.sb.existing_mapping = {}
@@ -247,18 +235,18 @@ class ElasticsearchSearchBackendTestCase(TestCase):
             self.sample_objs.append(mock)
 
     def tearDown(self):
-        connections['elasticsearch']._index = self.old_ui
+        connections['default']._index = self.old_ui
         super(ElasticsearchSearchBackendTestCase, self).tearDown()
         self.sb.silently_fail = True
 
     def raw_search(self, query):
         try:
-            return self.raw_es.search(q='*:*', index=settings.HAYSTACK_CONNECTIONS['elasticsearch']['INDEX_NAME'])
+            return self.raw_es.search(q='*:*', index=settings.HAYSTACK_CONNECTIONS['default']['INDEX_NAME'])
         except elasticsearch.TransportError:
             return {}
 
     def test_non_silent(self):
-        bad_sb = connections['elasticsearch'].backend('bad', URL='http://omg.wtf.bbq:1000/', INDEX_NAME='whatver', SILENTLY_FAIL=False, TIMEOUT=1)
+        bad_sb = connections['default'].backend('bad', URL='http://omg.wtf.bbq:1000/', INDEX_NAME='whatver', SILENTLY_FAIL=False, TIMEOUT=1)
 
         try:
             bad_sb.update(self.smmi, self.sample_objs)
@@ -285,13 +273,13 @@ class ElasticsearchSearchBackendTestCase(TestCase):
             pass
 
     def test_update_no_documents(self):
-        url = settings.HAYSTACK_CONNECTIONS['elasticsearch']['URL']
-        index_name = settings.HAYSTACK_CONNECTIONS['elasticsearch']['INDEX_NAME']
+        url = settings.HAYSTACK_CONNECTIONS['default']['URL']
+        index_name = settings.HAYSTACK_CONNECTIONS['default']['INDEX_NAME']
 
-        sb = connections['elasticsearch'].backend('elasticsearch', URL=url, INDEX_NAME=index_name, SILENTLY_FAIL=True)
+        sb = connections['default'].backend('default', URL=url, INDEX_NAME=index_name, SILENTLY_FAIL=True)
         self.assertEqual(sb.update(self.smmi, []), None)
 
-        sb = connections['elasticsearch'].backend('elasticsearch', URL=url, INDEX_NAME=index_name, SILENTLY_FAIL=False)
+        sb = connections['default'].backend('default', URL=url, INDEX_NAME=index_name, SILENTLY_FAIL=False)
         try:
             sb.update(self.smmi, [])
             self.fail()
@@ -397,7 +385,7 @@ class ElasticsearchSearchBackendTestCase(TestCase):
         self.assertEqual(self.sb.search('', highlight=True), {'hits': 0, 'results': []})
         self.assertEqual(self.sb.search('Index', highlight=True)['hits'], 3)
         self.assertEqual(sorted([result.highlighted[0] for result in self.sb.search('Index', highlight=True)['results']]),
-                         [u'<em>Indexed</em>!\n1', u'<em>Indexed</em>!\n2', u'<em>Indexed</em>!\n3'])
+            [u'<em>Indexed</em>!\n1', u'<em>Indexed</em>!\n2', u'<em>Indexed</em>!\n3'])
 
         self.assertEqual(self.sb.search('Indx')['hits'], 0)
         self.assertEqual(self.sb.search('indaxed')['spelling_suggestion'], 'indexed')
@@ -441,21 +429,6 @@ class ElasticsearchSearchBackendTestCase(TestCase):
         # Restore.
         settings.HAYSTACK_LIMIT_TO_REGISTERED_MODELS = old_limit_to_registered_models
 
-    def test_spatial_search_parameters(self):
-        p1 = Point(1.23, 4.56)
-        kwargs = self.sb.build_search_kwargs('*:*', distance_point={'field': 'location', 'point': p1},
-                                             sort_by=(('distance', 'desc'), ))
-
-        self.assertIn('sort', kwargs)
-        self.assertEqual(1, len(kwargs['sort']))
-        geo_d = kwargs['sort'][0]['_geo_distance']
-
-        # ElasticSearch supports the GeoJSON-style lng, lat pairs so unlike Solr the values should be
-        # in the same order as we used to create the Point():
-        # http://www.elasticsearch.org/guide/en/elasticsearch/reference/current/query-dsl-geo-distance-filter.html#_lat_lon_as_array_4
-
-        self.assertDictEqual(geo_d, {'location': [1.23, 4.56], 'unit': 'km', 'order': 'desc'})
-
     def test_more_like_this(self):
         self.sb.update(self.smmi, self.sample_objs)
         self.assertEqual(self.raw_search('*:*')['hits']['total'], 3)
@@ -466,11 +439,11 @@ class ElasticsearchSearchBackendTestCase(TestCase):
         self.assertEqual([result.pk for result in self.sb.more_like_this(self.sample_objs[0])['results']], [])
 
     def test_build_schema(self):
-        old_ui = connections['elasticsearch'].get_unified_index()
+        old_ui = connections['default'].get_unified_index()
 
         (content_field_name, mapping) = self.sb.build_schema(old_ui.all_searchfields())
         self.assertEqual(content_field_name, 'text')
-        self.assertEqual(len(mapping), 4 + 2)  # +2 management fields
+        self.assertEqual(len(mapping), 4+2) # +2 management fields
         self.assertEqual(mapping, {
             'django_id': {'index': 'not_analyzed', 'type': 'string', 'include_in_all': False},
             'django_ct': {'index': 'not_analyzed', 'type': 'string', 'include_in_all': False},
@@ -484,7 +457,7 @@ class ElasticsearchSearchBackendTestCase(TestCase):
         ui.build(indexes=[ElasticsearchComplexFacetsMockSearchIndex()])
         (content_field_name, mapping) = self.sb.build_schema(ui.all_searchfields())
         self.assertEqual(content_field_name, 'text')
-        self.assertEqual(len(mapping), 15 + 2)  # +2 management fields
+        self.assertEqual(len(mapping), 15+2) # +2 management fields
         self.assertEqual(mapping, {
             'django_id': {'index': 'not_analyzed', 'type': 'string', 'include_in_all': False},
             'django_ct': {'index': 'not_analyzed', 'type': 'string', 'include_in_all': False},
@@ -506,17 +479,17 @@ class ElasticsearchSearchBackendTestCase(TestCase):
         })
 
     def test_verify_type(self):
-        old_ui = connections['elasticsearch'].get_unified_index()
+        old_ui = connections['default'].get_unified_index()
         ui = UnifiedIndex()
         smtmmi = ElasticsearchMaintainTypeMockSearchIndex()
         ui.build(indexes=[smtmmi])
-        connections['elasticsearch']._index = ui
-        sb = connections['elasticsearch'].get_backend()
+        connections['default']._index = ui
+        sb = connections['default'].get_backend()
         sb.update(smtmmi, self.sample_objs)
 
         self.assertEqual(sb.search('*:*')['hits'], 3)
         self.assertEqual([result.month for result in sb.search('*:*')['results']], [u'02', u'02', u'02'])
-        connections['elasticsearch']._index = old_ui
+        connections['default']._index = old_ui
 
 
 class CaptureHandler(std_logging.Handler):
@@ -540,26 +513,26 @@ class FailedElasticsearchSearchBackendTestCase(TestCase):
         # Stow.
         # Point the backend at a URL that doesn't exist so we can watch the
         # sparks fly.
-        self.old_es_url = settings.HAYSTACK_CONNECTIONS['elasticsearch']['URL']
-        settings.HAYSTACK_CONNECTIONS['elasticsearch']['URL'] = "%s/foo/" % self.old_es_url
+        self.old_es_url = settings.HAYSTACK_CONNECTIONS['default']['URL']
+        settings.HAYSTACK_CONNECTIONS['default']['URL'] = "%s/foo/" % self.old_es_url
         self.cap = CaptureHandler()
         logging.getLogger('haystack').addHandler(self.cap)
         import haystack
         logging.getLogger('haystack').removeHandler(haystack.stream)
 
         # Setup the rest of the bits.
-        self.old_ui = connections['elasticsearch'].get_unified_index()
+        self.old_ui = connections['default'].get_unified_index()
         ui = UnifiedIndex()
         self.smmi = ElasticsearchMockSearchIndex()
         ui.build(indexes=[self.smmi])
-        connections['elasticsearch']._index = ui
-        self.sb = connections['elasticsearch'].get_backend()
+        connections['default']._index = ui
+        self.sb = connections['default'].get_backend()
 
     def tearDown(self):
         import haystack
         # Restore.
-        settings.HAYSTACK_CONNECTIONS['elasticsearch']['URL'] = self.old_es_url
-        connections['elasticsearch']._index = self.old_ui
+        settings.HAYSTACK_CONNECTIONS['default']['URL'] = self.old_es_url
+        connections['default']._index = self.old_ui
         logging.getLogger('haystack').removeHandler(self.cap)
         logging.getLogger('haystack').addHandler(haystack.stream)
 
@@ -597,54 +570,57 @@ class LiveElasticsearchSearchQueryTestCase(TestCase):
         clear_elasticsearch_index()
 
         # Stow.
-        self.old_ui = connections['elasticsearch'].get_unified_index()
+        self.old_ui = connections['default'].get_unified_index()
         self.ui = UnifiedIndex()
         self.smmi = ElasticsearchMockSearchIndex()
         self.ui.build(indexes=[self.smmi])
-        connections['elasticsearch']._index = self.ui
-        self.sb = connections['elasticsearch'].get_backend()
-        self.sq = connections['elasticsearch'].get_query()
+        connections['default']._index = self.ui
+        self.sb = connections['default'].get_backend()
+        self.sq = connections['default'].get_query()
 
         # Force indexing of the content.
-        self.smmi.update(using='elasticsearch')
+        self.smmi.update()
 
     def tearDown(self):
-        connections['elasticsearch']._index = self.old_ui
+        connections['default']._index = self.old_ui
         super(LiveElasticsearchSearchQueryTestCase, self).tearDown()
 
     def test_log_query(self):
+        from django.conf import settings
         reset_search_queries()
-        self.assertEqual(len(connections['elasticsearch'].queries), 0)
+        self.assertEqual(len(connections['default'].queries), 0)
 
-        with self.settings(DEBUG=False):
-            len(self.sq.get_results())
-            self.assertEqual(len(connections['elasticsearch'].queries), 0)
+        # Stow.
+        old_debug = settings.DEBUG
+        settings.DEBUG = False
 
-        with self.settings(DEBUG=True):
-            # Redefine it to clear out the cached results.
-            self.sq = connections['elasticsearch'].query(using='elasticsearch')
-            self.sq.add_filter(SQ(name='bar'))
-            len(self.sq.get_results())
-            self.assertEqual(len(connections['elasticsearch'].queries), 1)
-            self.assertEqual(connections['elasticsearch'].queries[0]['query_string'],
-                             'name:(bar)')
+        len(self.sq.get_results())
+        self.assertEqual(len(connections['default'].queries), 0)
 
-            # And again, for good measure.
-            self.sq = connections['elasticsearch'].query('elasticsearch')
-            self.sq.add_filter(SQ(name='bar'))
-            self.sq.add_filter(SQ(text='moof'))
-            len(self.sq.get_results())
-            self.assertEqual(len(connections['elasticsearch'].queries), 2)
-            self.assertEqual(connections['elasticsearch'].queries[0]['query_string'],
-                             'name:(bar)')
-            self.assertEqual(connections['elasticsearch'].queries[1]['query_string'],
-                             u'(name:(bar) AND text:(moof))')
+        settings.DEBUG = True
+        # Redefine it to clear out the cached results.
+        self.sq = connections['default'].query()
+        self.sq.add_filter(SQ(name='bar'))
+        len(self.sq.get_results())
+        self.assertEqual(len(connections['default'].queries), 1)
+        self.assertEqual(connections['default'].queries[0]['query_string'], 'name:(bar)')
+
+        # And again, for good measure.
+        self.sq = connections['default'].query()
+        self.sq.add_filter(SQ(name='bar'))
+        self.sq.add_filter(SQ(text='moof'))
+        len(self.sq.get_results())
+        self.assertEqual(len(connections['default'].queries), 2)
+        self.assertEqual(connections['default'].queries[0]['query_string'], 'name:(bar)')
+        self.assertEqual(connections['default'].queries[1]['query_string'], u'(name:(bar) AND text:(moof))')
+
+        # Restore.
+        settings.DEBUG = old_debug
 
 
 lssqstc_all_loaded = None
 
 
-@override_settings(DEBUG=True)
 class LiveElasticsearchSearchQuerySetTestCase(TestCase):
     """Used to test actual implementation details of the SearchQuerySet."""
     fixtures = ['bulk_data.json']
@@ -653,14 +629,16 @@ class LiveElasticsearchSearchQuerySetTestCase(TestCase):
         super(LiveElasticsearchSearchQuerySetTestCase, self).setUp()
 
         # Stow.
-        self.old_ui = connections['elasticsearch'].get_unified_index()
+        self.old_debug = settings.DEBUG
+        settings.DEBUG = True
+        self.old_ui = connections['default'].get_unified_index()
         self.ui = UnifiedIndex()
         self.smmi = ElasticsearchMockSearchIndex()
         self.ui.build(indexes=[self.smmi])
-        connections['elasticsearch']._index = self.ui
+        connections['default']._index = self.ui
 
-        self.sqs = SearchQuerySet('elasticsearch')
-        self.rsqs = RelatedSearchQuerySet('elasticsearch')
+        self.sqs = SearchQuerySet()
+        self.rsqs = RelatedSearchQuerySet()
 
         # Ugly but not constantly reindexing saves us almost 50% runtime.
         global lssqstc_all_loaded
@@ -672,11 +650,12 @@ class LiveElasticsearchSearchQuerySetTestCase(TestCase):
             clear_elasticsearch_index()
 
             # Force indexing of the content.
-            self.smmi.update(using='elasticsearch')
+            self.smmi.update()
 
     def tearDown(self):
         # Restore.
-        connections['elasticsearch']._index = self.old_ui
+        connections['default']._index = self.old_ui
+        settings.DEBUG = self.old_debug
         super(LiveElasticsearchSearchQuerySetTestCase, self).tearDown()
 
     def test_load_all(self):
@@ -687,66 +666,66 @@ class LiveElasticsearchSearchQuerySetTestCase(TestCase):
 
     def test_iter(self):
         reset_search_queries()
-        self.assertEqual(len(connections['elasticsearch'].queries), 0)
+        self.assertEqual(len(connections['default'].queries), 0)
         sqs = self.sqs.all()
         results = sorted([int(result.pk) for result in sqs])
         self.assertEqual(results, list(range(1, 24)))
-        self.assertEqual(len(connections['elasticsearch'].queries), 3)
+        self.assertEqual(len(connections['default'].queries), 3)
 
     def test_slice(self):
         reset_search_queries()
-        self.assertEqual(len(connections['elasticsearch'].queries), 0)
+        self.assertEqual(len(connections['default'].queries), 0)
         results = self.sqs.all().order_by('pub_date')
         self.assertEqual([int(result.pk) for result in results[1:11]], [3, 2, 4, 5, 6, 7, 8, 9, 10, 11])
-        self.assertEqual(len(connections['elasticsearch'].queries), 1)
+        self.assertEqual(len(connections['default'].queries), 1)
 
         reset_search_queries()
-        self.assertEqual(len(connections['elasticsearch'].queries), 0)
+        self.assertEqual(len(connections['default'].queries), 0)
         results = self.sqs.all().order_by('pub_date')
         self.assertEqual(int(results[21].pk), 22)
-        self.assertEqual(len(connections['elasticsearch'].queries), 1)
+        self.assertEqual(len(connections['default'].queries), 1)
 
     def test_count(self):
         reset_search_queries()
-        self.assertEqual(len(connections['elasticsearch'].queries), 0)
+        self.assertEqual(len(connections['default'].queries), 0)
         sqs = self.sqs.all()
         self.assertEqual(sqs.count(), 23)
         self.assertEqual(sqs.count(), 23)
         self.assertEqual(len(sqs), 23)
         self.assertEqual(sqs.count(), 23)
         # Should only execute one query to count the length of the result set.
-        self.assertEqual(len(connections['elasticsearch'].queries), 1)
+        self.assertEqual(len(connections['default'].queries), 1)
 
     def test_manual_iter(self):
         results = self.sqs.all()
 
         reset_search_queries()
-        self.assertEqual(len(connections['elasticsearch'].queries), 0)
+        self.assertEqual(len(connections['default'].queries), 0)
         results = set([int(result.pk) for result in results._manual_iter()])
         self.assertEqual(results, set([2, 7, 12, 17, 1, 6, 11, 16, 23, 5, 10, 15, 22, 4, 9, 14, 19, 21, 3, 8, 13, 18, 20]))
-        self.assertEqual(len(connections['elasticsearch'].queries), 3)
+        self.assertEqual(len(connections['default'].queries), 3)
 
     def test_fill_cache(self):
         reset_search_queries()
-        self.assertEqual(len(connections['elasticsearch'].queries), 0)
+        self.assertEqual(len(connections['default'].queries), 0)
         results = self.sqs.all()
         self.assertEqual(len(results._result_cache), 0)
-        self.assertEqual(len(connections['elasticsearch'].queries), 0)
+        self.assertEqual(len(connections['default'].queries), 0)
         results._fill_cache(0, 10)
         self.assertEqual(len([result for result in results._result_cache if result is not None]), 10)
-        self.assertEqual(len(connections['elasticsearch'].queries), 1)
+        self.assertEqual(len(connections['default'].queries), 1)
         results._fill_cache(10, 20)
         self.assertEqual(len([result for result in results._result_cache if result is not None]), 20)
-        self.assertEqual(len(connections['elasticsearch'].queries), 2)
+        self.assertEqual(len(connections['default'].queries), 2)
 
     def test_cache_is_full(self):
         reset_search_queries()
-        self.assertEqual(len(connections['elasticsearch'].queries), 0)
+        self.assertEqual(len(connections['default'].queries), 0)
         self.assertEqual(self.sqs._cache_is_full(), False)
         results = self.sqs.all()
         fire_the_iterator_and_fill_cache = [result for result in results]
         self.assertEqual(results._cache_is_full(), True)
-        self.assertEqual(len(connections['elasticsearch'].queries), 3)
+        self.assertEqual(len(connections['default'].queries), 3)
 
     def test___and__(self):
         sqs1 = self.sqs.filter(content='foo')
@@ -793,8 +772,22 @@ class LiveElasticsearchSearchQuerySetTestCase(TestCase):
         self.assertEqual(sqs.query.build_query(), u'("pants\\:rule")')
         self.assertEqual(len(sqs), 0)
 
+    def test_values_queries(self):
+        # TODO: add test for multivalued fields
+
+        self.assertEqual(
+            [v['pk'] for v in self.sqs.values('pk')],
+            [v.pk for v in self.sqs.all()])
+
+        self.assertEqual(
+            [(v['name'], v['pub_date'])
+             for v in self.sqs.values('name', 'pub_date')],
+            [(v.name, v.pub_date)
+             for v in self.sqs.all()])
+
     # Regressions
 
+    @unittest.expectedFailure
     def test_regression_proper_start_offsets(self):
         sqs = self.sqs.filter(text='index')
         self.assertNotEqual(sqs.count(), 0)
@@ -845,61 +838,61 @@ class LiveElasticsearchSearchQuerySetTestCase(TestCase):
 
     def test_related_iter(self):
         reset_search_queries()
-        self.assertEqual(len(connections['elasticsearch'].queries), 0)
+        self.assertEqual(len(connections['default'].queries), 0)
         sqs = self.rsqs.all()
         results = set([int(result.pk) for result in sqs])
         self.assertEqual(results, set([2, 7, 12, 17, 1, 6, 11, 16, 23, 5, 10, 15, 22, 4, 9, 14, 19, 21, 3, 8, 13, 18, 20]))
-        self.assertEqual(len(connections['elasticsearch'].queries), 4)
+        self.assertEqual(len(connections['default'].queries), 4)
 
     def test_related_slice(self):
         reset_search_queries()
-        self.assertEqual(len(connections['elasticsearch'].queries), 0)
+        self.assertEqual(len(connections['default'].queries), 0)
         results = self.rsqs.all().order_by('pub_date')
         self.assertEqual([int(result.pk) for result in results[1:11]], [3, 2, 4, 5, 6, 7, 8, 9, 10, 11])
-        self.assertEqual(len(connections['elasticsearch'].queries), 3)
+        self.assertEqual(len(connections['default'].queries), 3)
 
         reset_search_queries()
-        self.assertEqual(len(connections['elasticsearch'].queries), 0)
+        self.assertEqual(len(connections['default'].queries), 0)
         results = self.rsqs.all().order_by('pub_date')
         self.assertEqual(int(results[21].pk), 22)
-        self.assertEqual(len(connections['elasticsearch'].queries), 4)
+        self.assertEqual(len(connections['default'].queries), 4)
 
         reset_search_queries()
-        self.assertEqual(len(connections['elasticsearch'].queries), 0)
+        self.assertEqual(len(connections['default'].queries), 0)
         results = self.rsqs.all().order_by('pub_date')
         self.assertEqual(set([int(result.pk) for result in results[20:30]]), set([21, 22, 23]))
-        self.assertEqual(len(connections['elasticsearch'].queries), 4)
+        self.assertEqual(len(connections['default'].queries), 4)
 
     def test_related_manual_iter(self):
         results = self.rsqs.all()
 
         reset_search_queries()
-        self.assertEqual(len(connections['elasticsearch'].queries), 0)
+        self.assertEqual(len(connections['default'].queries), 0)
         results = sorted([int(result.pk) for result in results._manual_iter()])
         self.assertEqual(results, list(range(1, 24)))
-        self.assertEqual(len(connections['elasticsearch'].queries), 4)
+        self.assertEqual(len(connections['default'].queries), 4)
 
     def test_related_fill_cache(self):
         reset_search_queries()
-        self.assertEqual(len(connections['elasticsearch'].queries), 0)
+        self.assertEqual(len(connections['default'].queries), 0)
         results = self.rsqs.all()
         self.assertEqual(len(results._result_cache), 0)
-        self.assertEqual(len(connections['elasticsearch'].queries), 0)
+        self.assertEqual(len(connections['default'].queries), 0)
         results._fill_cache(0, 10)
         self.assertEqual(len([result for result in results._result_cache if result is not None]), 10)
-        self.assertEqual(len(connections['elasticsearch'].queries), 1)
+        self.assertEqual(len(connections['default'].queries), 1)
         results._fill_cache(10, 20)
         self.assertEqual(len([result for result in results._result_cache if result is not None]), 20)
-        self.assertEqual(len(connections['elasticsearch'].queries), 2)
+        self.assertEqual(len(connections['default'].queries), 2)
 
     def test_related_cache_is_full(self):
         reset_search_queries()
-        self.assertEqual(len(connections['elasticsearch'].queries), 0)
+        self.assertEqual(len(connections['default'].queries), 0)
         self.assertEqual(self.rsqs._cache_is_full(), False)
         results = self.rsqs.all()
         fire_the_iterator_and_fill_cache = [result for result in results]
         self.assertEqual(results._cache_is_full(), True)
-        self.assertEqual(len(connections['elasticsearch'].queries), 5)
+        self.assertEqual(len(connections['default'].queries), 5)
 
     def test_quotes_regression(self):
         sqs = self.sqs.auto_query(u"44°48'40''N 20°28'32''E")
@@ -966,7 +959,6 @@ class LiveElasticsearchSearchQuerySetTestCase(TestCase):
         self.assertTrue(isinstance(sqs[0], SearchResult))
 
 
-@override_settings(DEBUG=True)
 class LiveElasticsearchSpellingTestCase(TestCase):
     """Used to test actual implementation details of the SearchQuerySet."""
     fixtures = ['bulk_data.json']
@@ -975,26 +967,29 @@ class LiveElasticsearchSpellingTestCase(TestCase):
         super(LiveElasticsearchSpellingTestCase, self).setUp()
 
         # Stow.
-        self.old_ui = connections['elasticsearch'].get_unified_index()
+        self.old_debug = settings.DEBUG
+        settings.DEBUG = True
+        self.old_ui = connections['default'].get_unified_index()
         self.ui = UnifiedIndex()
         self.smmi = ElasticsearchMockSpellingIndex()
         self.ui.build(indexes=[self.smmi])
-        connections['elasticsearch']._index = self.ui
+        connections['default']._index = self.ui
 
-        self.sqs = SearchQuerySet('elasticsearch')
+        self.sqs = SearchQuerySet()
 
         # Wipe it clean.
         clear_elasticsearch_index()
 
         # Reboot the schema.
-        self.sb = connections['elasticsearch'].get_backend()
+        self.sb = connections['default'].get_backend()
         self.sb.setup()
 
-        self.smmi.update(using='elasticsearch')
+        self.smmi.update()
 
     def tearDown(self):
         # Restore.
-        connections['elasticsearch']._index = self.old_ui
+        connections['default']._index = self.old_ui
+        settings.DEBUG = self.old_debug
         super(LiveElasticsearchSpellingTestCase, self).tearDown()
 
     def test_spelling(self):
@@ -1013,23 +1008,25 @@ class LiveElasticsearchMoreLikeThisTestCase(TestCase):
         # Wipe it clean.
         clear_elasticsearch_index()
 
-        self.old_ui = connections['elasticsearch'].get_unified_index()
+        self.old_ui = connections['default'].get_unified_index()
         self.ui = UnifiedIndex()
         self.smmi = ElasticsearchMockModelSearchIndex()
         self.sammi = ElasticsearchAnotherMockModelSearchIndex()
         self.ui.build(indexes=[self.smmi, self.sammi])
-        connections['elasticsearch']._index = self.ui
+        connections['default']._index = self.ui
 
-        self.sqs = SearchQuerySet('elasticsearch')
+        self.sqs = SearchQuerySet()
 
-        self.smmi.update(using='elasticsearch')
-        self.sammi.update(using='elasticsearch')
+        self.smmi.update()
+        self.sammi.update()
+
 
     def tearDown(self):
         # Restore.
-        connections['elasticsearch']._index = self.old_ui
+        connections['default']._index = self.old_ui
         super(LiveElasticsearchMoreLikeThisTestCase, self).tearDown()
 
+    @unittest.expectedFailure
     def test_more_like_this(self):
         mlt = self.sqs.more_like_this(MockModel.objects.get(pk=1))
         self.assertEqual(mlt.count(), 4)
@@ -1059,6 +1056,7 @@ class LiveElasticsearchMoreLikeThisTestCase(TestCase):
         self.assertTrue(isinstance(self.sqs.result_class(MockSearchResult).more_like_this(MockModel.objects.get(pk=1))[0], MockSearchResult))
 
 
+
 class LiveElasticsearchAutocompleteTestCase(TestCase):
     fixtures = ['bulk_data.json']
 
@@ -1066,30 +1064,30 @@ class LiveElasticsearchAutocompleteTestCase(TestCase):
         super(LiveElasticsearchAutocompleteTestCase, self).setUp()
 
         # Stow.
-        self.old_ui = connections['elasticsearch'].get_unified_index()
+        self.old_ui = connections['default'].get_unified_index()
         self.ui = UnifiedIndex()
         self.smmi = ElasticsearchAutocompleteMockModelSearchIndex()
         self.ui.build(indexes=[self.smmi])
-        connections['elasticsearch']._index = self.ui
+        connections['default']._index = self.ui
 
-        self.sqs = SearchQuerySet('elasticsearch')
+        self.sqs = SearchQuerySet()
 
         # Wipe it clean.
         clear_elasticsearch_index()
 
         # Reboot the schema.
-        self.sb = connections['elasticsearch'].get_backend()
+        self.sb = connections['default'].get_backend()
         self.sb.setup()
 
-        self.smmi.update(using='elasticsearch')
+        self.smmi.update()
 
     def tearDown(self):
         # Restore.
-        connections['elasticsearch']._index = self.old_ui
+        connections['default']._index = self.old_ui
         super(LiveElasticsearchAutocompleteTestCase, self).tearDown()
 
     def test_build_schema(self):
-        self.sb = connections['elasticsearch'].get_backend()
+        self.sb = connections['default'].get_backend()
         content_name, mapping = self.sb.build_schema(self.ui.all_searchfields())
         self.assertEqual(mapping, {
             'django_id': {'index': 'not_analyzed', 'type': 'string', 'include_in_all': False},
@@ -1143,16 +1141,6 @@ class LiveElasticsearchAutocompleteTestCase(TestCase):
         self.assertEqual(set([result.pk for result in autocomplete_3]), set(['12', '1', '22', '14']))
         self.assertEqual(len([result.pk for result in autocomplete_3]), 4)
 
-        # Test numbers in phrases
-        autocomplete_4 = self.sqs.autocomplete(text_auto='Jen 867')
-        self.assertEqual(autocomplete_4.count(), 1)
-        self.assertEqual(set([result.pk for result in autocomplete_4]), set(['20']))
-
-        # Test numbers alone
-        autocomplete_4 = self.sqs.autocomplete(text_auto='867')
-        self.assertEqual(autocomplete_4.count(), 1)
-        self.assertEqual(set([result.pk for result in autocomplete_4]), set(['20']))
-
 
 class LiveElasticsearchRoundTripTestCase(TestCase):
     def setUp(self):
@@ -1162,14 +1150,14 @@ class LiveElasticsearchRoundTripTestCase(TestCase):
         clear_elasticsearch_index()
 
         # Stow.
-        self.old_ui = connections['elasticsearch'].get_unified_index()
+        self.old_ui = connections['default'].get_unified_index()
         self.ui = UnifiedIndex()
         self.srtsi = ElasticsearchRoundTripSearchIndex()
         self.ui.build(indexes=[self.srtsi])
-        connections['elasticsearch']._index = self.ui
-        self.sb = connections['elasticsearch'].get_backend()
+        connections['default']._index = self.ui
+        self.sb = connections['default'].get_backend()
 
-        self.sqs = SearchQuerySet('elasticsearch')
+        self.sqs = SearchQuerySet()
 
         # Fake indexing.
         mock = MockModel()
@@ -1178,7 +1166,7 @@ class LiveElasticsearchRoundTripTestCase(TestCase):
 
     def tearDown(self):
         # Restore.
-        connections['elasticsearch']._index = self.old_ui
+        connections['default']._index = self.old_ui
         super(LiveElasticsearchRoundTripTestCase, self).tearDown()
 
     def test_round_trip(self):
@@ -1202,45 +1190,45 @@ class LiveElasticsearchRoundTripTestCase(TestCase):
         self.assertEqual(result.sites, [3, 5, 1])
 
 
-@unittest.skipUnless(test_pickling, 'Skipping pickling tests')
-class LiveElasticsearchPickleTestCase(TestCase):
-    fixtures = ['bulk_data.json']
+if test_pickling:
+    class LiveElasticsearchPickleTestCase(TestCase):
+        fixtures = ['bulk_data.json']
 
-    def setUp(self):
-        super(LiveElasticsearchPickleTestCase, self).setUp()
+        def setUp(self):
+            super(LiveElasticsearchPickleTestCase, self).setUp()
 
-        # Wipe it clean.
-        clear_elasticsearch_index()
+            # Wipe it clean.
+            clear_elasticsearch_index()
 
-        # Stow.
-        self.old_ui = connections['elasticsearch'].get_unified_index()
-        self.ui = UnifiedIndex()
-        self.smmi = ElasticsearchMockModelSearchIndex()
-        self.sammi = ElasticsearchAnotherMockModelSearchIndex()
-        self.ui.build(indexes=[self.smmi, self.sammi])
-        connections['elasticsearch']._index = self.ui
+            # Stow.
+            self.old_ui = connections['default'].get_unified_index()
+            self.ui = UnifiedIndex()
+            self.smmi = ElasticsearchMockModelSearchIndex()
+            self.sammi = ElasticsearchAnotherMockModelSearchIndex()
+            self.ui.build(indexes=[self.smmi, self.sammi])
+            connections['default']._index = self.ui
 
-        self.sqs = SearchQuerySet('elasticsearch')
+            self.sqs = SearchQuerySet()
 
-        self.smmi.update(using='elasticsearch')
-        self.sammi.update(using='elasticsearch')
+            self.smmi.update()
+            self.sammi.update()
 
-    def tearDown(self):
-        # Restore.
-        connections['elasticsearch']._index = self.old_ui
-        super(LiveElasticsearchPickleTestCase, self).tearDown()
+        def tearDown(self):
+            # Restore.
+            connections['default']._index = self.old_ui
+            super(LiveElasticsearchPickleTestCase, self).tearDown()
 
-    def test_pickling(self):
-        results = self.sqs.all()
+        def test_pickling(self):
+            results = self.sqs.all()
 
-        for res in results:
-            # Make sure the cache is full.
-            pass
+            for res in results:
+                # Make sure the cache is full.
+                pass
 
-        in_a_pickle = pickle.dumps(results)
-        like_a_cuke = pickle.loads(in_a_pickle)
-        self.assertEqual(len(like_a_cuke), len(results))
-        self.assertEqual(like_a_cuke[0].id, results[0].id)
+            in_a_pickle = pickle.dumps(results)
+            like_a_cuke = pickle.loads(in_a_pickle)
+            self.assertEqual(len(like_a_cuke), len(results))
+            self.assertEqual(like_a_cuke[0].id, results[0].id)
 
 
 class ElasticsearchBoostBackendTestCase(TestCase):
@@ -1248,16 +1236,16 @@ class ElasticsearchBoostBackendTestCase(TestCase):
         super(ElasticsearchBoostBackendTestCase, self).setUp()
 
         # Wipe it clean.
-        self.raw_es = elasticsearch.Elasticsearch(settings.HAYSTACK_CONNECTIONS['elasticsearch']['URL'])
+        self.raw_es = elasticsearch.Elasticsearch(settings.HAYSTACK_CONNECTIONS['default']['URL'])
         clear_elasticsearch_index()
 
         # Stow.
-        self.old_ui = connections['elasticsearch'].get_unified_index()
+        self.old_ui = connections['default'].get_unified_index()
         self.ui = UnifiedIndex()
         self.smmi = ElasticsearchBoostMockSearchIndex()
         self.ui.build(indexes=[self.smmi])
-        connections['elasticsearch']._index = self.ui
-        self.sb = connections['elasticsearch'].get_backend()
+        connections['default']._index = self.ui
+        self.sb = connections['default'].get_backend()
 
         self.sample_objs = []
 
@@ -1276,17 +1264,17 @@ class ElasticsearchBoostBackendTestCase(TestCase):
             self.sample_objs.append(mock)
 
     def tearDown(self):
-        connections['elasticsearch']._index = self.old_ui
+        connections['default']._index = self.old_ui
         super(ElasticsearchBoostBackendTestCase, self).tearDown()
 
     def raw_search(self, query):
-        return self.raw_es.search(q='*:*', index=settings.HAYSTACK_CONNECTIONS['elasticsearch']['INDEX_NAME'])
+        return self.raw_es.search(q='*:*', index=settings.HAYSTACK_CONNECTIONS['default']['INDEX_NAME'])
 
     def test_boost(self):
         self.sb.update(self.smmi, self.sample_objs)
         self.assertEqual(self.raw_search('*:*')['hits']['total'], 4)
 
-        results = SearchQuerySet(using='elasticsearch').filter(SQ(author='daniel') | SQ(editor='daniel'))
+        results = SearchQuerySet().filter(SQ(author='daniel') | SQ(editor='daniel'))
 
         self.assertEqual(set([result.id for result in results]), set([
             'core.afourthmockmodel.4',
@@ -1310,12 +1298,12 @@ class ElasticsearchBoostBackendTestCase(TestCase):
 class RecreateIndexTestCase(TestCase):
     def setUp(self):
         self.raw_es = elasticsearch.Elasticsearch(
-            settings.HAYSTACK_CONNECTIONS['elasticsearch']['URL'])
+            settings.HAYSTACK_CONNECTIONS['default']['URL'])
 
     def test_recreate_index(self):
         clear_elasticsearch_index()
 
-        sb = connections['elasticsearch'].get_backend()
+        sb = connections['default'].get_backend()
         sb.silently_fail = True
         sb.setup()
 
@@ -1328,9 +1316,8 @@ class RecreateIndexTestCase(TestCase):
             updated_mapping = self.raw_es.indices.get_mapping(sb.index_name)
         except elasticsearch.NotFoundError:
             self.fail("There is no mapping after recreating the index")
-
         self.assertEqual(original_mapping, updated_mapping,
-                         "Mapping after recreating the index differs from the original one")
+            "Mapping after recreating the index differs from the original one")
 
 
 class ElasticsearchFacetingTestCase(TestCase):
@@ -1341,12 +1328,12 @@ class ElasticsearchFacetingTestCase(TestCase):
         clear_elasticsearch_index()
 
         # Stow.
-        self.old_ui = connections['elasticsearch'].get_unified_index()
+        self.old_ui = connections['default'].get_unified_index()
         self.ui = UnifiedIndex()
         self.smmi = ElasticsearchFacetingMockSearchIndex()
         self.ui.build(indexes=[self.smmi])
-        connections['elasticsearch']._index = self.ui
-        self.sb = connections['elasticsearch'].get_backend()
+        connections['default']._index = self.ui
+        self.sb = connections['default'].get_backend()
 
         # Force the backend to rebuild the mapping each time.
         self.sb.existing_mapping = {}
@@ -1369,12 +1356,12 @@ class ElasticsearchFacetingTestCase(TestCase):
             self.sample_objs.append(mock)
 
     def tearDown(self):
-        connections['elasticsearch']._index = self.old_ui
+        connections['default']._index = self.old_ui
         super(ElasticsearchFacetingTestCase, self).tearDown()
 
     def test_facet(self):
         self.sb.update(self.smmi, self.sample_objs)
-        counts = SearchQuerySet('elasticsearch').facet('author').facet('editor').facet_counts()
+        counts = SearchQuerySet().facet('author').facet('editor').facet_counts()
         self.assertEqual(counts['fields']['author'], [
             ('Daniel Lindsley', 5),
             ('Dan Watson', 4),
@@ -1383,7 +1370,7 @@ class ElasticsearchFacetingTestCase(TestCase):
             ('Perry White', 5),
             ('George Taylor', 4),
         ])
-        counts = SearchQuerySet('elasticsearch').filter(content='white').facet('facet_field', order='reverse_count').facet_counts()
+        counts = SearchQuerySet().filter(content='white').facet('facet_field', order='reverse_count').facet_counts()
         self.assertEqual(counts['fields']['facet_field'], [
             ('Dan Watson', 2),
             ('Daniel Lindsley', 3),
@@ -1391,14 +1378,14 @@ class ElasticsearchFacetingTestCase(TestCase):
 
     def test_multiple_narrow(self):
         self.sb.update(self.smmi, self.sample_objs)
-        counts = SearchQuerySet('elasticsearch').narrow('editor_exact:"Perry White"').narrow('author_exact:"Daniel Lindsley"').facet('author').facet_counts()
+        counts = SearchQuerySet().narrow('editor_exact:"Perry White"').narrow('author_exact:"Daniel Lindsley"').facet('author').facet_counts()
         self.assertEqual(counts['fields']['author'], [
             ('Daniel Lindsley', 3),
         ])
 
     def test_narrow(self):
         self.sb.update(self.smmi, self.sample_objs)
-        counts = SearchQuerySet('elasticsearch').facet('author').facet('editor').narrow('editor_exact:"Perry White"').facet_counts()
+        counts = SearchQuerySet().facet('author').facet('editor').narrow('editor_exact:"Perry White"').facet_counts()
         self.assertEqual(counts['fields']['author'], [
             ('Daniel Lindsley', 3),
             ('Dan Watson', 2),
@@ -1412,7 +1399,7 @@ class ElasticsearchFacetingTestCase(TestCase):
         start = datetime.date(2013, 9, 1)
         end = datetime.date(2013, 9, 30)
         # Facet by day
-        counts = SearchQuerySet('elasticsearch').date_facet('pub_date', start_date=start, end_date=end, gap_by='day').facet_counts()
+        counts = SearchQuerySet().date_facet('pub_date', start_date=start, end_date=end, gap_by='day').facet_counts()
         self.assertEqual(counts['dates']['pub_date'], [
             (datetime.datetime(2013, 9, 1), 2),
             (datetime.datetime(2013, 9, 2), 3),
@@ -1420,7 +1407,7 @@ class ElasticsearchFacetingTestCase(TestCase):
             (datetime.datetime(2013, 9, 4), 2),
         ])
         # By month
-        counts = SearchQuerySet('elasticsearch').date_facet('pub_date', start_date=start, end_date=end, gap_by='month').facet_counts()
+        counts = SearchQuerySet().date_facet('pub_date', start_date=start, end_date=end, gap_by='month').facet_counts()
         self.assertEqual(counts['dates']['pub_date'], [
             (datetime.datetime(2013, 9, 1), 9),
         ])
